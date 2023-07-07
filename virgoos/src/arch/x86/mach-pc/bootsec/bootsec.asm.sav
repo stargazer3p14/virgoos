@@ -1,0 +1,243 @@
+;
+;	BOOTSEC.ASM
+;
+;	Source file for the Sept-OS boot sector (1.44M diskette)
+;
+
+
+%INCLUDE	"include/bootsec.inc"
+;CODE	SEGMENT	PARA	PUBLIC	USE16
+;ASSUME	CS:CODE, DS:CODE
+;.586p
+
+SEGMENT	.text
+USE16
+
+org 7C00H
+
+
+zero_start:
+
+
+boot_start:
+
+;	jmp START	; to the end of BPB
+	jmp short START	; to the end of BPB
+	nop
+
+bsOemName               DB      "SOS     "      ; 0x03
+
+;;;;;;;;;;;;;;;;;;;;;
+;; BPB starts here ;;
+;;;;;;;;;;;;;;;;;;;;;
+
+bpbBytesPerSector       DW      200H	; 0x0B
+bpbSectorsPerCluster    DB      1	; 0x0D
+bpbReservedSectors      DW      1	; 0x0E
+bpbNumberOfFATs         DB      0	; 0x10
+bpbRootEntries          DW      0	; 0x11
+bpbTotalSectors         DW      0b40H	; 0x13
+bpbMedia                DB      0f0H	; 0x15
+bpbSectorsPerFAT        DW      0	; 0x16
+bpbSectorsPerTrack      DW      12H	; 0x18
+bpbHeadsPerCylinder     DW      2	; 0x1A
+bpbHiddenSectors        DD      0	; 0x1C
+bpbTotalSectorsBig      DD      0	; 0x20
+
+;;;;;;;;;;;;;;;;;;;
+;; BPB ends here ;;
+;;;;;;;;;;;;;;;;;;;
+
+bsDriveNumber           DB      0	; 0x24
+bsUnused                DB      0	; 0x25
+bsExtBootSignature      DB      29	; 0x26
+bsImageSize		DW      0	; 0x27
+bsReserved		DW	0	; 0x29
+bsVolumeLabel           DB      "NO NAME    "   ; 0x2B
+bsFileSystem            DB      "FAT12   "      ; 0x36
+
+;
+;	Our data starts here
+;
+
+;Gdt	LABEL	FWORD
+Gdt:
+;						DTR	< 17h, (offset Gdt) >
+;						DW	0					; Pad to 8 bytes
+;						Descriptor32	< 0FFFFh, 0, 0, CODE_ACCESS, 0Fh OR FLAT_ATTR, 0 >		; CODE flat descriptor
+;						Descriptor32	< 0FFFFh, 0, 0, DATA_ACCESS, 0Fh OR FLAT_ATTR, 0 >		; DATA flat descriptor
+ISTRUC	DTR	
+	AT	Limit, DW	17h
+	AT	Base, DD	Gdt
+IEND
+	DW	0
+;	Descriptor32	0FFFFh, 0, 0, CODE_ACCESS, 0Fh OR FLAT_ATTR, 0	; CODE flat descriptor
+
+ISTRUC	Descriptor32
+	AT	Limit16, DW	0FFFFh
+	AT	Base16, DW	0
+	AT	Base24, DB	0
+	AT	Access, DB	CODE_ACCESS
+	AT	Limit20_GD, DB	0Fh | FLAT_ATTR
+	AT	Base32, DB	0
+IEND
+
+;	Descriptor32	0FFFFh, 0, 0, DATA_ACCESS, 0Fh OR FLAT_ATTR, 0 	; DATA flat descriptor
+ISTRUC	Descriptor32
+	AT	Limit16, DW	0FFFFh
+	AT	Base16, DW	0
+	AT	Base24, DB	0
+	AT	Access, DB	DATA_ACCESS
+	AT	Limit20_GD, DB	0Fh | FLAT_ATTR
+	AT	Base32, DB	0
+IEND
+GDT_LIMIT	EQU	$ - Gdt
+
+
+CurrTrack	db 0
+CurrHead	db 0
+CurrImagePtr	dd APP_START - 10000h
+
+START:
+	cli					
+						
+	mov ax, 9000h		; set up the top of the stack at 900FEh
+	mov ss, ax
+	mov sp, 0FEh
+
+	push	cs
+	pop	ds
+
+	;
+	;	Enable A20 address line
+	;
+	mov	al, CMD_A20_Access
+	out	KBD_COMMAND, al
+	IODelay
+	mov	al, CMD_A20_On
+	out	KBD_DATA, al
+	IODelay
+
+	;
+	;	Go to "unreal" mode (load ES with BASE=0 LIMIT=FFFFFFFF descriptor).
+	;
+	cli
+	lgdt	[Gdt]
+	mov	eax, cr0
+	or	eax, byte CR0_PE
+	mov	cr0, eax
+
+	push	byte DATA_32
+	pop	es
+
+	and	eax, byte ~CR0_PE
+	mov	cr0, eax
+	sti
+
+	;
+	;	Load embedded application starting at APP_START. PE header must reflect it correctly
+	;
+	push	1000h			; set up the buffer at 010000H
+	pop	es
+	mov	edi, APP_START - 10000h	; the start address will be here
+
+	sub	dx, dx			; DL = 0 -- drive A: (need to be modified if there will ever be boot from drive B :-)
+						; DH = 0 -- head 0 first
+	sub	bx, bx			; ES:BX -> read buffer, ES:EDI -> application's memory
+	mov	cx, 2			; CH = 0 -- track number, CL = 2 -- first application's sector
+	mov	ax, 211h		; AH = 2 -- read sectors, AL = 11h -- read 17 sectors from first track
+	
+read_sectors_loop:
+;	mov	si, 3
+;read_retries_loop:
+;	push	ax
+	int	13h				; Do read sectors
+						; Disregard status - if crashing, there's not much to do anyway (may be should retry 3 times)
+;	jnc	sectors_read
+;	pop	ax
+;	dec	si
+;	jnz	read_retries_loop
+	
+; 3 unsuccessful retries carried out - halt
+;	cli
+;	hlt
+	
+;sectors_read:
+;	add	sp, 2
+
+	; Copy data to application's memory
+	push	cx
+	movzx	ecx, al
+	shl	cx, 7			; There won't be more than 64 sectors for this INT 13, that is max. 32K
+	sub	esi, esi
+	cld
+	rep	A32 es movsd	; EDI is accumilating from previous write
+	pop	cx
+
+	sub	[bsImageSize], ax	; Adjust remaining sectors to read
+	jng	FINISH			; If bsImageSize remained <= 0, we're done
+	
+	mov	ax, 212h		; This is after 0 track, read 18 sectors
+	and	cl, 11000000b	; Clear sector number field
+	or	cl, 1			; Start with sector #1
+	xor	dh, 1			; Switch head
+	jnz	read_sectors_loop
+	
+	inc	ch				; Increment track number
+	jnz	read_sectors_loop
+	add	cl, 01000000b	; 0 after INC means overflow: increment high-order bits of cylinder number
+						; It's natural to use CF for overflow, but INC doesn't affect CF;  therefore ZF is used
+	jmp	read_sectors_loop
+	
+FINISH:
+; Reset disk (and turn off motor)
+	sub	ax, ax
+	sub	dx, dx
+	int	13h
+	mov	dx, 3F2h
+	mov	al, 0Ch
+	out	dx, al
+
+; Switch to protected mode
+	cli
+	mov	eax, cr0
+	or	eax, byte CR0_PE
+	mov	cr0, eax
+
+; Setup segment registers
+	mov	ax, DATA_32
+	mov	ds, ax
+	mov	es, ax
+	mov	fs, ax
+	mov	gs, ax
+	mov	ss, ax
+	mov	esp, STACK_START
+
+	;
+	; We may actually want to set up application's stack and commit sections here, if space permits
+	;
+	
+; Far jump to entry point
+	;pushfd
+	push	byte CODE_32
+	sub	eax, eax
+	;mov	eax, [APP_START + NT_HDR_PTR + eax]
+	mov  ecx, [APP_START + ENTRY_PTR - 4 + eax]
+	;mov  ecx, [APP_START + ENTRY_PTR + eax]
+	add	ecx, [APP_START + IMAGE_BASE - 4 + eax]
+	;add	ecx, [APP_START + IMAGE_BASE + eax]
+	push	ecx
+
+	O32
+	retf
+	;iretd
+
+;filler	db 510 - ( $ - offset boot_start ) dup (?)
+filler	resb 510 - ($ - boot_start)
+
+	db 55H
+	db 0aaH
+;CODE	ENDS
+
+END
+

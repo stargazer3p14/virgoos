@@ -1,0 +1,312 @@
+;
+;	BOOTSEC.ASM
+;
+;	Source file for the Sept-OS boot sector (1.44M diskette)
+;
+
+
+%INCLUDE	"include-gcc/bootsec.inc"
+;CODE	SEGMENT	PARA	PUBLIC	USE16
+;ASSUME	CS:CODE, DS:CODE
+;.586p
+
+SEGMENT	.text
+USE16
+
+org 7C00H
+
+
+zero_start:
+
+
+boot_start:
+
+;	jmp START	; to the end of BPB
+	jmp short START	; to the end of BPB
+	nop
+
+bsOemName               DB      "SOS     "      ; 0x03
+
+;;;;;;;;;;;;;;;;;;;;;
+;; BPB starts here ;;
+;;;;;;;;;;;;;;;;;;;;;
+
+bpbBytesPerSector       DW      200H	; 0x0B
+bpbSectorsPerCluster    DB      1	; 0x0D
+bpbReservedSectors      DW      1	; 0x0E
+bpbNumberOfFATs         DB      0	; 0x10
+bpbRootEntries          DW      0	; 0x11
+bpbTotalSectors         DW      0b40H	; 0x13
+bpbMedia                DB      0f0H	; 0x15
+bpbSectorsPerFAT        DW      0	; 0x16
+bpbSectorsPerTrack      DW      12H	; 0x18
+bpbHeadsPerCylinder     DW      2	; 0x1A
+bpbHiddenSectors        DD      0	; 0x1C
+bpbTotalSectorsBig      DD      0	; 0x20
+
+;;;;;;;;;;;;;;;;;;;
+;; BPB ends here ;;
+;;;;;;;;;;;;;;;;;;;
+
+bsDriveNumber           DB      0	; 0x24
+bsUnused                DB      0	; 0x25
+bsExtBootSignature      DB      29	; 0x26
+bsImageSize		DW      0	; 0x27
+bsReserved		DW	0	; 0x29
+bsVolumeLabel           DB      "NO NAME    "   ; 0x2B
+bsFileSystem            DB      "FAT12   "      ; 0x36
+
+;
+;	Our data starts here
+;
+
+;Gdt	LABEL	FWORD
+Gdt:
+;						DTR	< 17h, (offset Gdt) >
+;						DW	0					; Pad to 8 bytes
+;						Descriptor32	< 0FFFFh, 0, 0, CODE_ACCESS, 0Fh OR FLAT_ATTR, 0 >		; CODE flat descriptor
+;						Descriptor32	< 0FFFFh, 0, 0, DATA_ACCESS, 0Fh OR FLAT_ATTR, 0 >		; DATA flat descriptor
+ISTRUC	DTR	
+	AT	Limit, DW	17h
+	AT	Base, DD	Gdt
+IEND
+	DW	0
+;	Descriptor32	0FFFFh, 0, 0, CODE_ACCESS, 0Fh OR FLAT_ATTR, 0	; CODE flat descriptor
+
+ISTRUC	Descriptor32
+	AT	Limit16, DW	0FFFFh
+	AT	Base16, DW	0
+	AT	Base24, DB	0
+	AT	Access, DB	CODE_ACCESS
+	AT	Limit20_GD, DB	0Fh | FLAT_ATTR
+	AT	Base32, DB	0
+IEND
+
+;	Descriptor32	0FFFFh, 0, 0, DATA_ACCESS, 0Fh OR FLAT_ATTR, 0 	; DATA flat descriptor
+ISTRUC	Descriptor32
+	AT	Limit16, DW	0FFFFh
+	AT	Base16, DW	0
+	AT	Base24, DB	0
+	AT	Access, DB	DATA_ACCESS
+	AT	Limit20_GD, DB	0Fh | FLAT_ATTR
+	AT	Base32, DB	0
+IEND
+GDT_LIMIT	EQU	$ - Gdt
+
+
+CurrTrack	db 0
+CurrHead	db 0
+CurrImagePtr	dd APP_START - 10000h
+
+START:
+	cli			; set up the top of the stack
+	mov ax, 9000h		; at 900FEh
+	mov ss, ax
+	mov sp, 0FEh
+
+	push	cs
+	pop	ds
+
+	mov	edi, APP_START - 10000h	; the start address will be here
+
+	;
+	;	Enable A20 address line
+	;
+	mov	al, CMD_A20_Access
+	out	KBD_COMMAND, al
+	IODelay
+	mov	al, CMD_A20_On
+	out	KBD_DATA, al
+	IODelay
+
+
+	;
+	;	Go to "unreal" mode.
+	;
+	cli
+	lgdt	[Gdt]
+	mov	eax, cr0
+	or	eax, byte CR0_PE
+	mov	cr0, eax
+
+	push	byte DATA_32
+	pop	es
+
+;	and	eax, NOT CR0_PE
+
+	and	eax, byte ~ CR0_PE
+	mov	cr0, eax
+	sti
+
+	push	1000h			; set up the buffer at 010000H
+	pop	es
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; First, read up to the end of the first track
+
+
+;	cmp 	WORD PTR bsImageSize, 12h - 1	; 18 - 1 sector of the bootsec
+	cmp 	WORD [bsImageSize], byte 12h - 1	; 18 - 1 sector of the bootsec
+
+	jg	LESS1
+;	mov	al, BYTE PTR bsImageSize	; big endian so in byte ptr is the smallest byte
+	mov	al, BYTE [bsImageSize]	; little endian so in byte ptr is the smallest byte
+
+;	mov	WORD PTR bsImageSize, 0
+	mov	WORD [bsImageSize], 0
+
+	jmp 	short LESS2
+LESS1:	
+;	sub	WORD PTR bsImageSize, 12h-1
+	sub	WORD [bsImageSize], byte 12h-1
+
+	mov	al, 12h-1
+
+
+LESS2:	
+	; start to read the first track up to the end
+
+	; al - # of sectors to read
+	; es:bx - the buffer to read into
+	; dl - drive number
+	; dh - head
+	; ch - track no.
+	; cl - sect. to start from
+
+	sub	bx, bx
+	mov 	ah, 02h		; 02 - int13 read sectors
+	mov 	dl, 0
+	mov 	dh, 0
+	mov 	ch, 0
+	mov 	cl, 2		; skip bootsector
+	int 	13H
+
+
+; Copy sectors to address APP_START
+	xor	ah, ah			; ax contains number of sectors read
+	shl	ax, 7			; mul (512/4=128=2^7) dwords per sector
+	movzx	ecx, ax			; ecx contains  number of double words read
+	sub	esi, esi
+	cld
+;	rep	movs dword ptr es:[ edi ], es:[ esi ]
+	rep	A32 es movsd
+
+
+;	cmp 	WORD PTR bsImageSize, 0
+	cmp 	WORD [bsImageSize], byte 0
+
+	je	FINISH
+;	inc 	CurrHead	; the current head becomes 1
+	inc 	byte [CurrHead]	; the current head becomes 1
+
+READ_NEXT:
+;	cmp 	WORD PTR bsImageSize, 12h	; 18 sectors to read
+	cmp 	WORD [bsImageSize], byte 12h	; 18 sectors to read
+	jg	NEXT1				; if all the track
+
+;	mov	al, BYTE PTR bsImageSize	; else the number of sectors left
+	mov	al, BYTE [bsImageSize]	; else the number of sectors left
+
+;	mov	WORD PTR bsImageSize, 0
+	mov	WORD [bsImageSize], 0
+	jmp 	short NEXT2
+
+NEXT1:
+;	sub	WORD PTR bsImageSize, 12h
+	sub	WORD [bsImageSize], byte 12h
+	mov	al, 12h
+
+NEXT2:
+	; read a track
+
+	; al - # of sectors to read
+	; es:bx - the buffer to read into
+	; dl - drive number
+	; dh - head
+	; ch - track no.
+	; cl - sect. to start from
+
+	sub	bx, bx
+	mov 	ah, 02h		; 02 - int13 read sectors
+	mov 	dl, 0
+;	mov 	dh, BYTE PTR CurrHead
+	mov 	dh, BYTE [CurrHead]
+;	mov 	ch, BYTE PTR CurrTrack
+	mov 	ch, BYTE [CurrTrack]
+	mov 	cl, 1		; starting from the first sector
+	int 	13H
+
+; Copy sectors to address APP_START
+	xor	ah, ah
+	shl	ax, 7
+	movzx	ecx, ax			; cx contains number of double words read
+	sub	esi, esi
+	cld
+;	rep	movs dword ptr es:[ edi ], es:[ esi ]
+	rep	A32 es movsd
+
+;	cmp	WORD PTR bsImageSize, 0
+	cmp	WORD [bsImageSize], byte 0
+	je	FINISH
+
+;	cmp 	CurrHead, 1		; done with this side?
+	cmp 	byte [CurrHead], 1		; done with this side?
+	jne	NEXT_SIDE		; yes - go to the next track
+
+;	dec	BYTE PTR CurrHead
+	dec	BYTE [CurrHead]
+;	inc	BYTE PTR CurrTrack
+	inc	BYTE [CurrTrack]
+	jmp	READ_NEXT
+
+NEXT_SIDE:				; else use the other side
+;	inc	BYTE PTR CurrHead
+	inc	BYTE [CurrHead]
+	jmp	READ_NEXT
+
+
+FINISH:
+; Reset disk (and turn off motor)
+	sub	ax, ax
+	sub	dx, dx
+	int	13h
+	mov	dx, 3F2h
+	mov	al, 0Ch
+	out	dx, al
+
+; Switch to protected mode
+	cli
+	mov	eax, cr0
+	or	eax, byte CR0_PE
+	mov	cr0, eax
+
+; Setup segment registers
+	mov	ax, DATA_32
+	mov	ds, ax
+	mov	es, ax
+	mov	fs, ax
+	mov	gs, ax
+	mov	ss, ax
+	mov	esp, STACK_START
+
+
+; Far jump to entry point
+	push	byte CODE_32
+	sub	eax, eax
+;	mov	eax, [APP_START + NT_HDR_PTR + eax]
+	mov	eax, [APP_START + ENTRY_PTR - 4 + eax]
+	add	eax, APP_START
+	push	eax
+; 	db 66h
+	O32
+	retf
+
+;filler	db 510 - ( $ - offset boot_start ) dup (?)
+filler	resb 510 - ( $ - boot_start )
+
+	db 55H
+	db 0aaH
+;CODE	ENDS
+
+END
+
